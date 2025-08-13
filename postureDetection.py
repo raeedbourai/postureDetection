@@ -12,8 +12,11 @@ import torchvision.models as models
 from torchvision.models import ResNet18_Weights
 from torchvision import datasets, transforms
 from torch.utils.data import random_split, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import confusion_matrix,accuracy_score
 from PIL import Image
+
+writer = SummaryWriter()
 
 seq = iaa.Sequential([
     iaa.Fliplr(0.5),
@@ -22,13 +25,11 @@ seq = iaa.Sequential([
     iaa.LinearContrast((0.75, 1.5))
 ], random_order=True)
 
-# Function to apply imgaug on a PIL image
 def imgaug_transform(img):
-    img_np = np.array(img)  # PIL → NumPy
+    img_np = np.array(img)
     img_aug = seq(image=img_np)
     return Image.fromarray(img_aug)
 
-# Training transforms with augmentation
 train_transform = transforms.Compose([
     transforms.Lambda(imgaug_transform),
     transforms.Resize((224, 224)),
@@ -37,7 +38,6 @@ train_transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-# Validation transforms (no augmentation)
 val_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -69,7 +69,7 @@ model = model.to(device)
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.fc.parameters(), lr=0.001)
 
-num_epochs = 10
+num_epochs = 50
 
 for epoch in range(num_epochs):
     model.train()
@@ -92,22 +92,40 @@ for epoch in range(num_epochs):
         correct += (predicted == labels).sum().item()
 
     train_acc = correct / total * 100
-    print(f"Epoch {epoch+1}, Loss: {running_loss:.4f}, Train Acc: {train_acc:.2f}%")
+    avg_loss = running_loss / len(train_loader)
+
 
     # Validation
     model.eval()
     correct = 0
     total = 0
+    val_loss = 0.0
     with torch.no_grad():
         for inputs, labels in val_loader:
             inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            val_loss += loss.item()
+
             _, predicted = torch.max(outputs, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
     val_acc = correct / total * 100
-    print(f"Validation Acc: {val_acc:.2f}%\n")
+    avg_val_loss = val_loss / len(val_loader)
+
+    print(f"Epoch {epoch+1}/{num_epochs} "
+          f"Train Loss: {avg_loss:.4f} Train Acc: {train_acc:.2f}% "
+          f"Val Loss: {avg_val_loss:.4f} Val Acc: {val_acc:.2f}%")
+
+    writer.add_scalar('Loss/train', avg_loss, epoch)
+    writer.add_scalar('Loss/val', avg_val_loss, epoch)
+    writer.add_scalar('Accuracy/train', train_acc, epoch)
+    writer.add_scalar('Accuracy/val', val_acc, epoch)
+
+    writer.flush()
+
+writer.close()
 
 
 # images = np.array(
