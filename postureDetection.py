@@ -1,153 +1,223 @@
 import os
-import numpy as np 
-import imageio.v3 as imageio
-import imgaug as ia
-from imgaug import augmenters as iaa
-import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
-from sklearn.model_selection import KFold
+import numpy as np
+from PIL import Image
+from collections import defaultdict
+from datetime import datetime
+
 import torch
 import torch.nn as nn
-import torchvision.models as models
-from torchvision.models import ResNet18_Weights
-from torchvision import datasets, transforms
-from torch.utils.data import random_split, DataLoader
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import confusion_matrix,accuracy_score
-from PIL import Image
+from torchvision import datasets, models, transforms
 
-writer = SummaryWriter()
+import imgaug as ia
+from imgaug import augmenters as iaa
+from sklearn.model_selection import StratifiedKFold
+
+
+src_root = "dataset" 
+n_folds = 5
+num_augments = 8
+batch_size = 8         
+num_epochs = 50
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 seq = iaa.Sequential([
     iaa.Fliplr(0.5),
-    iaa.Crop(percent=(0, 0.3), keep_size=True),
-    iaa.Sometimes(0.5, iaa.GaussianBlur(sigma=5.0)),
-    iaa.LinearContrast((0.75, 1.5))
+    iaa.Crop(percent=(0,0.3), keep_size=True),
+    iaa.Sometimes(0.5, iaa.GaussianBlur(sigma=(0,3.0))),
+    iaa.LinearContrast((0.75,1.5)),
 ], random_order=True)
 
-def imgaug_transform(img):
-    img_np = np.array(img)
-    img_aug = seq(image=img_np)
-    return Image.fromarray(img_aug)
 
-train_transform = transforms.Compose([
-    transforms.Lambda(imgaug_transform),
-    transforms.Resize((224, 224)),
+to_tensor_norm = transforms.Compose([
+    transforms.Resize((224,224)),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225])
+    transforms.Normalize([0.485,0.456,0.406], [0.229,0.224,0.225])
 ])
 
-val_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225])
-])
 
-dataset = datasets.ImageFolder('dataset', transform=None)
+image_paths = []
+labels = []
 
-train_size = int(0.8 * len(dataset))
-val_size = len(dataset) - train_size
+class_to_idx = {"goodPosture":0, "badPosture":1}
+for class_name in ["goodPosture","badPosture"]:
+    class_dir = os.path.join(src_root, class_name)
+    for img_name in os.listdir(class_dir):
+        if img_name.lower().endswith(('.png','.jpg','.jpeg')):
+            image_paths.append(os.path.join(class_dir, img_name))
+            labels.append(class_to_idx[class_name])
 
-train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+image_paths = np.array(image_paths)
+labels = np.array(labels)
 
-train_dataset.dataset.transform = train_transform
-val_dataset.dataset.transform = val_transform
 
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+class AugmentedDataset(Dataset):
+    def __init__(self, image_paths, labels, num_augments=8, augment=True):
+        self.image_paths = image_paths
+        self.labels = labels
+        self.num_augments = num_augments
+        self.augment = augment
 
-model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
+    def __len__(self):
+        return len(self.image_paths)
 
-num_ftrs = model.fc.in_features
-model.fc = nn.Linear(num_ftrs, 2)
+    def __getitem__(self, idx):
+        img = Image.open(self.image_paths[idx]).convert("RGB")
+        label = self.labels[idx]
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
+        images = [img]
+        img_np = np.array(img)
 
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.fc.parameters(), lr=0.001)
+        if self.augment:
+            for _ in range(self.num_augments):
+                aug_img_np = seq(image=img_np)
+                images.append(Image.fromarray(aug_img_np))
 
-num_epochs = 50
+        images = torch.stack([to_tensor_norm(im) for im in images])
+        labels = torch.tensor([label]*(len(images)))
+
+        return images, labels
+
+
+skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+avg_writer = SummaryWriter(log_dir=f"runs/experiment_{timestamp}_avg")
+
+fold_results = []
+all_fold_metrics = defaultdict(list)
+
+
+for fold, (train_idx, val_idx) in enumerate(skf.split(image_paths, labels), 1):
+    print(f"\n=== Fold {fold} ===")
+    fold_writer = SummaryWriter(log_dir=f"runs/experiment_{timestamp}/fold_{fold}")
+
+    train_dataset = AugmentedDataset(image_paths[train_idx], labels[train_idx], num_augments=num_augments, augment=True)
+    val_dataset   = AugmentedDataset(image_paths[val_idx], labels[val_idx], num_augments=0, augment=False)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+    num_ftrs = model.fc.in_features
+    model.fc = nn.Linear(num_ftrs, 2)
+    model = model.to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.fc.parameters(), lr=0.001)
+
+    fold_train_losses, fold_val_losses = [], []
+    fold_train_accs, fold_val_accs = [], []
+
+
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        for imgs, lbls in train_loader:
+            # imgs shape: [batch_size, num_aug+1, C,H,W] -> flatten
+            batch_size_curr, n_copies, C,H,W = imgs.shape
+            imgs = imgs.view(-1, C,H,W).to(device)
+            lbls = lbls.view(-1).to(device)
+
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, lbls)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs,1)
+            total += lbls.size(0)
+            correct += (predicted==lbls).sum().item()
+
+        train_acc = correct/total*100
+        avg_train_loss = running_loss / len(train_loader)
+
+        model.eval()
+        val_loss = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for imgs, lbls in val_loader:
+                batch_size_curr, n_copies, C,H,W = imgs.shape
+                imgs = imgs.view(-1,C,H,W).to(device)
+                lbls = lbls.view(-1).to(device)
+
+                outputs = model(imgs)
+                loss = criterion(outputs, lbls)
+                val_loss += loss.item()
+                _, predicted = torch.max(outputs,1)
+                total += lbls.size(0)
+                correct += (predicted==lbls).sum().item()
+
+        val_acc = correct/total*100
+        avg_val_loss = val_loss / len(val_loader)
+
+        print(f"Epoch {epoch+1}/{num_epochs} "
+              f"Train Loss: {avg_train_loss:.4f} Train Acc: {train_acc:.2f}% "
+              f"Val Loss: {avg_val_loss:.4f} Val Acc: {val_acc:.2f}%")
+
+        fold_train_losses.append(avg_train_loss)
+        fold_val_losses.append(avg_val_loss)
+        fold_train_accs.append(train_acc)
+        fold_val_accs.append(val_acc)
+
+        fold_writer.add_scalar(f'Loss/train_fold_{fold}', avg_train_loss, epoch)
+        fold_writer.add_scalar(f'Loss/val_fold_{fold}', avg_val_loss, epoch)
+        fold_writer.add_scalar(f'Accuracy/train_fold_{fold}', train_acc, epoch)
+        fold_writer.add_scalar(f'Accuracy/val_fold_{fold}', val_acc, epoch)
+
+        all_fold_metrics[f'train_loss_epoch_{epoch}'].append(avg_train_loss)
+        all_fold_metrics[f'val_loss_epoch_{epoch}'].append(avg_val_loss)
+        all_fold_metrics[f'train_acc_epoch_{epoch}'].append(train_acc)
+        all_fold_metrics[f'val_acc_epoch_{epoch}'].append(val_acc)
+
+    fold_writer.close()
+
+    fold_results.append({
+        'fold': fold,
+        'final_train_loss': fold_train_losses[-1],
+        'final_val_loss': fold_val_losses[-1],
+        'final_train_acc': fold_train_accs[-1],
+        'final_val_acc': fold_val_accs[-1],
+        'best_val_acc': max(fold_val_accs)
+    })
+
 
 for epoch in range(num_epochs):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    avg_writer.add_scalar('Average/train_loss', np.mean(all_fold_metrics[f'train_loss_epoch_{epoch}']), epoch)
+    avg_writer.add_scalar('Average/val_loss', np.mean(all_fold_metrics[f'val_loss_epoch_{epoch}']), epoch)
+    avg_writer.add_scalar('Average/train_acc', np.mean(all_fold_metrics[f'train_acc_epoch_{epoch}']), epoch)
+    avg_writer.add_scalar('Average/val_acc', np.mean(all_fold_metrics[f'val_acc_epoch_{epoch}']), epoch)
 
-    for inputs, labels in train_loader:
-        inputs, labels = inputs.to(device), labels.to(device)
-
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        running_loss += loss.item()
-        _, predicted = torch.max(outputs, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-
-    train_acc = correct / total * 100
-    avg_loss = running_loss / len(train_loader)
+avg_writer.close()
 
 
-    # Validation
-    model.eval()
-    correct = 0
-    total = 0
-    val_loss = 0.0
-    with torch.no_grad():
-        for inputs, labels in val_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            val_loss += loss.item()
+final_train_accs = [r['final_train_acc'] for r in fold_results]
+final_val_accs = [r['final_val_acc'] for r in fold_results]
+best_val_accs  = [r['best_val_acc']  for r in fold_results]
 
-            _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+print("\nCROSS-VALIDATION SUMMARY")
+print(f"Final Train Acc: {np.mean(final_train_accs):.2f}% ± {np.std(final_train_accs):.2f}%")
+print(f"Final Val   Acc: {np.mean(final_val_accs):.2f}% ± {np.std(final_val_accs):.2f}%")
+print(f"Best Val    Acc: {np.mean(best_val_accs):.2f}% ± {np.std(best_val_accs):.2f}%")
 
-    val_acc = correct / total * 100
-    avg_val_loss = val_loss / len(val_loader)
-
-    print(f"Epoch {epoch+1}/{num_epochs} "
-          f"Train Loss: {avg_loss:.4f} Train Acc: {train_acc:.2f}% "
-          f"Val Loss: {avg_val_loss:.4f} Val Acc: {val_acc:.2f}%")
-
-    writer.add_scalar('Loss/train', avg_loss, epoch)
-    writer.add_scalar('Loss/val', avg_val_loss, epoch)
-    writer.add_scalar('Accuracy/train', train_acc, epoch)
-    writer.add_scalar('Accuracy/val', val_acc, epoch)
-
-    writer.flush()
-
-writer.close()
+for r in fold_results:
+    print(f"Fold {r['fold']}: Val Acc={r['final_val_acc']:.2f}%, Best Val Acc={r['best_val_acc']:.2f}%")
 
 
-# images = np.array(
-#     [imageio.imread('images/frame544.jpg') for _ in range(32)],
-#     dtype=np.uint8
-# )
-
-# seq = iaa.Sequential([
-#     iaa.Fliplr(0.5),
-#     iaa.Crop(percent=(0, 0.3), keep_size=True),
-#     iaa.Sometimes(0.5, iaa.GaussianBlur(sigma=5.0)),
-#     iaa.LinearContrast((0.75, 1.5)),
-#     # iaa.Multiply((0.8, 1.2), per_channel=0.2),
-#     # iaa.Affine(
-#     #     # scale={"x": (0.8, 1.2), "y": (0.8, 1.2)},
-#     #     # translate_percent={"x": (-0.2, 0.2), "y": (-0.2, 0.2)},
-#     # )
-# ], random_order=True)
-
-# images_aug = seq(images=images)
-
-# print("Augmented:")
-# plt.imshow(ia.draw_grid(images_aug[:8], cols=4, rows=2))
-# plt.axis('off')
-# plt.show()
+# CROSS-VALIDATION SUMMARY run 1
+# Final Train Acc: 76.03% ± 0.75%
+# Final Val   Acc: 69.84% ± 3.01%
+# Best Val    Acc: 75.49% ± 3.40%
+# Fold 1: Val Acc=73.12%, Best Val Acc=75.27%
+# Fold 2: Val Acc=66.30%, Best Val Acc=75.00%
+# Fold 3: Val Acc=66.30%, Best Val Acc=69.57%
+# Fold 4: Val Acc=72.83%, Best Val Acc=78.26%
+# Fold 5: Val Acc=70.65%, Best Val Acc=79.35%
