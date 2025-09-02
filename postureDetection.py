@@ -102,7 +102,6 @@ def run_crossval(lr, batch_size, num_augments, num_epochs, n_folds, save_dir):
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-        # Model
         model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         model.fc = nn.Linear(model.fc.in_features, 2)
         model = model.to(device)
@@ -119,7 +118,6 @@ def run_crossval(lr, batch_size, num_augments, num_epochs, n_folds, save_dir):
         fold_train_accs, fold_val_accs = [], []
 
         for epoch in range(num_epochs):
-            # ---- Train ----
             model.train()
             running_loss, correct, total = 0.0, 0, 0
 
@@ -142,13 +140,11 @@ def run_crossval(lr, batch_size, num_augments, num_epochs, n_folds, save_dir):
             avg_train_loss = running_loss / len(train_loader)
             train_acc = correct / total * 100
 
-            # ---- Validation ----
             model.eval()
             val_loss, correct, total = 0.0, 0, 0
             misclassified = []
-            correctly_classified = []   # <--- NEW
+            correctly_classified = []
 
-            # set up Grad-CAM for this model
             target_layer = model.layer4[-1]
             cam = GradCAM(model=model, target_layers=[target_layer])
 
@@ -186,18 +182,15 @@ def run_crossval(lr, batch_size, num_augments, num_epochs, n_folds, save_dir):
             fold_train_accs.append(train_acc)
             fold_val_accs.append(val_acc)
 
-            # Log scalars
             fold_writer.add_scalar('Loss/train', avg_train_loss, epoch)
             fold_writer.add_scalar('Loss/val', avg_val_loss, epoch)
             fold_writer.add_scalar('Accuracy/train', train_acc, epoch)
             fold_writer.add_scalar('Accuracy/val', val_acc, epoch)
             fold_writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
 
-            # === Misclassified + Grad-CAM Logging ===
             if misclassified:
-                to_show = misclassified[:10]  # fewer to keep TensorBoard lighter
+                to_show = misclassified[:10] 
                 for idx, (img, true, pred) in enumerate(to_show):
-                    # Original unnormalized image
                     img_vis = unnormalize(img).clamp(0,1)
                     fold_writer.add_image(
                         f"Misclassified/epoch_{epoch+1}_true{true}_pred{pred}",
@@ -205,7 +198,6 @@ def run_crossval(lr, batch_size, num_augments, num_epochs, n_folds, save_dir):
                         global_step=epoch
                     )
 
-                    # Grad-CAM visualization
                     rgb_img = img_vis.permute(1,2,0).numpy()
                     input_tensor = img.unsqueeze(0).to(device)
                     grayscale_cam = cam(input_tensor=input_tensor)[0, :]
@@ -218,11 +210,9 @@ def run_crossval(lr, batch_size, num_augments, num_epochs, n_folds, save_dir):
                         global_step=epoch
                     )
             
-            # === Correctly Classified + Grad-CAM Logging ===
             if correctly_classified:
-                to_show_correct = correctly_classified[:10]  # limit for TensorBoard
+                to_show_correct = correctly_classified[:10]  
                 for idx, (img, true, pred) in enumerate(to_show_correct):
-                    # Original unnormalized image
                     img_vis = unnormalize(img).clamp(0,1)
                     fold_writer.add_image(
                         f"Correct/epoch_{epoch+1}_true{true}_pred{pred}",
@@ -230,7 +220,6 @@ def run_crossval(lr, batch_size, num_augments, num_epochs, n_folds, save_dir):
                         global_step=epoch
                     )
 
-                    # Grad-CAM visualization
                     rgb_img = img_vis.permute(1,2,0).numpy()
                     input_tensor = img.unsqueeze(0).to(device)
                     grayscale_cam = cam(input_tensor=input_tensor)[0, :]
@@ -248,7 +237,6 @@ def run_crossval(lr, batch_size, num_augments, num_epochs, n_folds, save_dir):
             all_fold_metrics[f'train_acc_epoch_{epoch}'].append(train_acc)
             all_fold_metrics[f'val_acc_epoch_{epoch}'].append(val_acc)
 
-            # Save checkpoints
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_model_wts = copy.deepcopy(model.state_dict())
@@ -257,7 +245,6 @@ def run_crossval(lr, batch_size, num_augments, num_epochs, n_folds, save_dir):
             if (epoch+1) % 10 == 0:
                 torch.save(model.state_dict(), os.path.join(save_dir, f"fold{fold}_epoch{epoch+1}.pth"))
 
-        # Log hyperparameters
         hparams = {"lr": lr, "batch_size": batch_size, "num_augments": num_augments, "fold": fold}
         metrics = {"final_val_acc": val_acc, "best_val_acc": best_val_acc}
         fold_writer.add_hparams(hparams, metrics)
@@ -296,38 +283,3 @@ if __name__=="__main__":
         )
         print(f"Fold Results: {[r['final_val_acc'] for r in fold_results]}")
 
-# === Running experiment: lr=0.001, batch_size=8, num_augments=8 ===
-
-# === Fold 1 ===
-
-# === Fold 2 ===
-
-# === Fold 3 ===
-# Fold Results: [71.42857142857143, 70.12987012987013, 75.16339869281046]
-
-# === Running experiment: lr=0.001, batch_size=16, num_augments=8 ===
-
-# === Fold 1 ===
-                                                                                                                                                            
-# === Fold 2 ===
-
-# === Fold 3 ===
-# Fold Results: [72.07792207792207, 71.42857142857143, 76.47058823529412]
-
-# === Running experiment: lr=0.0005, batch_size=8, num_augments=8 ===
-
-# === Fold 1 ===
-                                                
-# === Fold 2 ===
-
-# === Fold 3 ===
-# Fold Results: [69.48051948051948, 66.88311688311688, 75.81699346405229]
-
-# === Running experiment: lr=0.0005, batch_size=16, num_augments=8 ===
-
-# === Fold 1 ===
-
-# === Fold 2 ===
-
-# === Fold 3 ===
-# Fold Results: [67.53246753246754, 67.53246753246754, 75.81699346405229]
